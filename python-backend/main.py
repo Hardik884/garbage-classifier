@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tensorflow as tf
@@ -6,12 +6,13 @@ import numpy as np
 from PIL import Image
 import io
 import base64
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
+import requests
+from math import radians, cos, sin, asin, sqrt
 
 app = FastAPI(title="Garbage Classifier API", version="1.0.0")
 
-# Configure CORS to allow Next.js frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -20,12 +21,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for model and categories
 model = None
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "garbage_classifier_fixed.keras")
 
-# Define your 6 categories - MUST match the model's training order!
-# ⚠️ ASK YOUR FRIEND FOR THE EXACT ORDER!
 CATEGORIES = [
     "cardboard",
     "glass", 
@@ -35,7 +33,6 @@ CATEGORIES = [
     "trash",
 ]
 
-# Disposal tips for each category
 TIPS = {
     "recyclable": "Rinse recyclables to remove food residue before placing them in the bin.",
     "non-recyclable": "Consider reusing or disposing of non-recyclables responsibly.",
@@ -49,7 +46,7 @@ TIPS = {
 
 
 class ImageRequest(BaseModel):
-    image: str  # Base64 encoded image with data URL prefix
+    image: str 
 
 
 class PredictionScore(BaseModel):
@@ -68,16 +65,16 @@ def load_model():
     global model
     try:
         if not os.path.exists(MODEL_PATH):
-            print(f"⚠️  Model file not found at: {MODEL_PATH}")
-            print(f"   Please place your 'garbage_classifier.h5' file in the 'models' folder")
+            print(f"Model file not found at: {MODEL_PATH}")
+            print(f"Please place your 'garbage_classifier.keras' file in the 'models' folder")
             return
         
         model = tf.keras.models.load_model(MODEL_PATH)
-        print(f"✅ Model loaded successfully from {MODEL_PATH}")
-        print(f"   Model input shape: {model.input_shape}")
-        print(f"   Model output shape: {model.output_shape}")
+        print(f"Model loaded successfully from {MODEL_PATH}")
+        print(f"Model input shape: {model.input_shape}")
+        print(f"Model output shape: {model.output_shape}")
     except Exception as e:
-        print(f"❌ Error loading model: {str(e)}")
+        print(f"Error loading model: {str(e)}")
         model = None
 
 
@@ -87,30 +84,21 @@ def preprocess_image(base64_image: str, target_size=(224, 224)):
     Adjust target_size based on your model's input requirements
     """
     try:
-        # Remove data URL prefix if present
         if "," in base64_image:
             base64_image = base64_image.split(",")[1]
-        
-        # Decode base64
+
         image_bytes = base64.b64decode(base64_image)
         
-        # Open image with PIL
         image = Image.open(io.BytesIO(image_bytes))
         
-        # Convert to RGB if needed
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Resize to model's expected input size
         image = image.resize(target_size)
-        
-        # Convert to numpy array
         img_array = np.array(image)
         
-        # Normalize pixel values to [0, 1] - adjust if your model expects different normalization
         img_array = img_array.astype(np.float32) / 255.0
         
-        # Add batch dimension
         img_array = np.expand_dims(img_array, axis=0)
         
         return img_array
@@ -159,17 +147,13 @@ async def classify_image(request: ImageRequest):
         )
     
     try:
-        # Preprocess the image
         img_array = preprocess_image(request.image)
         
-        # Make prediction
         predictions = model.predict(img_array, verbose=0)
         
-        # Get prediction probabilities (assuming model outputs probabilities)
         if len(predictions.shape) == 2:
-            predictions = predictions[0]  # Remove batch dimension
-        
-        # Create scores for all categories
+            predictions = predictions[0]
+
         scores = []
         for i, category in enumerate(CATEGORIES):
             confidence = float(predictions[i]) if i < len(predictions) else 0.0
@@ -178,13 +162,10 @@ async def classify_image(request: ImageRequest):
                 confidence=round(confidence, 2)
             ))
         
-        # Sort by confidence (highest first)
         scores.sort(key=lambda x: x.confidence, reverse=True)
-        
-        # Get top prediction
+    
         top = scores[0]
-        
-        # Get disposal tip
+    
         tip = TIPS.get(top.label, "Dispose according to local guidelines.")
         
         return ClassificationResponse(
@@ -210,6 +191,177 @@ async def test_endpoint(request: ImageRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate the great circle distance between two points on earth in kilometers"""
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    return 6371 * c  # Radius of earth in kilometers
+
+
+def get_overpass_query(lat: float, lng: float, radius: int, material: str) -> str:
+    """
+    Generate Overpass QL query for recycling/waste facilities
+    Searches for amenities and facilities related to waste management
+    """
+    # Map material types to Overpass tags
+    material_tags = {
+        "cardboard": ["recycling", "recycling_centre", "waste_disposal"],
+        "glass": ["recycling", "recycling_centre", "bottle_bank"],
+        "metal": ["recycling", "recycling_centre", "scrap_yard"],
+        "paper": ["recycling", "recycling_centre", "waste_disposal"],
+        "plastic": ["recycling", "recycling_centre", "waste_disposal"],
+        "trash": ["waste_disposal", "waste_transfer_station", "waste_basket"]
+    }
+    
+    tags = material_tags.get(material.lower(), ["recycling", "recycling_centre", "waste_disposal"])
+    
+    # Build query for multiple amenity types
+    queries = []
+    for tag in tags:
+        queries.append(f'node["amenity"="{tag}"](around:{radius},{lat},{lng});')
+        queries.append(f'way["amenity"="{tag}"](around:{radius},{lat},{lng});')
+    
+    query = f"""
+    [out:json][timeout:10];
+    (
+      {''.join(queries)}
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    return query
+
+
+@app.get("/places")
+async def nearby_places(
+    lat: float = Query(..., description="Latitude", ge=-90, le=90),
+    lng: float = Query(..., description="Longitude", ge=-180, le=180),
+    material: Optional[str] = Query("recycling", description="Material type from classification"),
+    radius: int = Query(10000, description="Search radius in meters", ge=100, le=50000)
+):
+    """
+    Find nearby recycling and waste disposal points using OpenStreetMap Overpass API
+    Free to use, no API key required
+    """
+    try:
+        # Use public Overpass API endpoint
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        
+        query = get_overpass_query(lat, lng, radius, material)
+        
+        response = requests.post(
+            overpass_url,
+            data={"data": query},
+            timeout=15,
+            headers={"User-Agent": "GarbageClassifierApp/1.0"}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Overpass API error: {response.status_code}"
+            )
+        
+        data = response.json()
+        elements = data.get("elements", [])
+        
+        # Process results
+        results = []
+        seen_ids = set()
+        
+        for element in elements:
+            # Skip if we've already processed this element
+            if element.get("id") in seen_ids:
+                continue
+            
+            # Only process nodes and ways with tags
+            if element.get("type") not in ["node", "way"]:
+                continue
+            
+            tags = element.get("tags", {})
+            if not tags:
+                continue
+            
+            # Get coordinates
+            if element.get("type") == "node":
+                elem_lat = element.get("lat")
+                elem_lng = element.get("lon")
+            elif element.get("type") == "way" and element.get("center"):
+                elem_lat = element["center"].get("lat")
+                elem_lng = element["center"].get("lon")
+            else:
+                continue
+            
+            if elem_lat is None or elem_lng is None:
+                continue
+            
+            # Calculate distance
+            distance_km = haversine_km(lat, lng, elem_lat, elem_lng)
+            
+            # Extract useful information
+            name = tags.get("name", tags.get("amenity", "Recycling Point").replace("_", " ").title())
+            
+            # Build address from available tags
+            address_parts = []
+            for key in ["addr:street", "addr:housenumber", "addr:city", "addr:postcode"]:
+                if tags.get(key):
+                    address_parts.append(tags[key])
+            address = ", ".join(address_parts) if address_parts else "Address not available"
+            
+            # Get opening hours if available
+            opening_hours = tags.get("opening_hours")
+            
+            # Get recycling types if specified
+            recycling_types = []
+            for key, value in tags.items():
+                if key.startswith("recycling:") and value == "yes":
+                    recycling_types.append(key.replace("recycling:", ""))
+            
+            results.append({
+                "name": name,
+                "address": address,
+                "location": {
+                    "lat": elem_lat,
+                    "lng": elem_lng
+                },
+                "distance_km": round(distance_km, 2),
+                "amenity_type": tags.get("amenity", "unknown"),
+                "opening_hours": opening_hours,
+                "recycling_types": recycling_types if recycling_types else None,
+                "phone": tags.get("phone"),
+                "website": tags.get("website"),
+                "osm_id": element.get("id"),
+                "osm_type": element.get("type")
+            })
+            
+            seen_ids.add(element.get("id"))
+        
+        # Sort by distance
+        results.sort(key=lambda x: x["distance_km"])
+        
+        return {
+            "count": len(results),
+            "results": results,
+            "query_info": {
+                "latitude": lat,
+                "longitude": lng,
+                "radius_meters": radius,
+                "material": material
+            }
+        }
+    
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Request to Overpass API timed out")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error contacting Overpass API: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 if __name__ == "__main__":
