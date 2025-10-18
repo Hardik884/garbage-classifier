@@ -3,6 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { CategoryBadge } from "./category-badge";
+import { FindRecycling } from "./find-recycling";
 import type { ClassificationResult } from "@/lib/classifier";
 import { Recycle, ShieldAlert } from "lucide-react";
 
@@ -101,6 +102,8 @@ export function ResultView({
           ))}
         </CardContent>
       </Card>
+
+      <FindRecycling material={top.label} />
     </div>
   );
 }

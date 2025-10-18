@@ -20,6 +20,7 @@ import { Separator } from "@/components/ui/separator";
 import { useToast } from "./hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { SiteHeader } from "./components/site-header";
+import { FindRecycling } from "./components/find-recycling";
 import { Recycle, ShieldAlert } from "lucide-react";
 
 // Types
@@ -326,6 +327,8 @@ function PredictionResult({ result }: { result: UnifiedResponse }) {
           })}
         </div>
       </div>
+
+      <FindRecycling material={top.label} />
     </div>
   );
 }
